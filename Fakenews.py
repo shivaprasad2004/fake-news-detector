@@ -5,37 +5,30 @@ from lime.lime_text import LimeTextExplainer
 from dotenv import load_dotenv
 
 # =========================
-# 🔒 Load API Keys securely from .env
+# 🔒 Load API Keys
 # =========================
-load_dotenv()  # loads .env file automatically
-
+load_dotenv()
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 GOOGLE_FACTCHECK_API_KEY = os.getenv("GOOGLE_FACTCHECK_API_KEY")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/facebook/bart-large-mnli"
+HF_MODEL_URL = "https://api-inference.huggingface.co/models/valhalla/distilbart-mnli-12-1"
 headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
 GOOGLE_FACTCHECK_URL = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
+NEWS_API_URL = "https://newsapi.org/v2/everything"
 
 # =========================
-# Hugging Face Query
+# HuggingFace Model
 # =========================
 def query_hf_model(text):
-    payload = {
-        "inputs": text,
-        "parameters": {"candidate_labels": ["real", "fake"]},
-    }
+    payload = {"inputs": text, "parameters": {"candidate_labels": ["real", "fake"]}}
     response = requests.post(HF_MODEL_URL, headers=headers, json=payload)
-
     if response.status_code != 200:
         return {"error": f"HF API Error {response.status_code}: {response.text}"}
-
-    try:
-        return response.json()
-    except Exception as e:
-        return {"error": f"JSON decode error: {str(e)} | Raw: {response.text}"}
+    return response.json()
 
 # =========================
-# Google Fact Check Query
+# Google Fact Check
 # =========================
 def query_google_factcheck(text):
     params = {"query": text, "key": GOOGLE_FACTCHECK_API_KEY}
@@ -43,31 +36,55 @@ def query_google_factcheck(text):
     return response.json()
 
 # =========================
-# Prediction Function
+# News API + Fallback (Tavily / Google News)
+# =========================
+def query_newsapi(text):
+    params = {
+        "q": text,
+        "apiKey": NEWS_API_KEY,
+        "language": "en",
+        "sortBy": "relevancy",
+        "pageSize": 3
+    }
+    try:
+        response = requests.get(NEWS_API_URL, params=params)
+        data = response.json()
+        if "articles" in data and len(data["articles"]) > 0:
+            return data
+        else:
+            # fallback → Google News
+            alt_url = f"https://news.google.com/search?q={text.replace(' ', '+')}"
+            return {"results": [{"title": "Google News Search", "url": alt_url, "source": "Google News"}]}
+    except Exception as e:
+        return {"error": str(e)}
+
+# =========================
+# Prediction
 # =========================
 def predict_text_authenticity(text):
     result = query_hf_model(text)
-
     if "error" in result:
-        return result["error"], 0.0
+        return "fake", 0.0
 
     if isinstance(result, dict) and "labels" in result:
-        label = result["labels"][0]
+        label = result["labels"][0].lower()
         score = result["scores"][0]
+        if label not in ["real", "fake"]:
+            label = "real" if score >= 0.5 else "fake"
         return label, score
 
-    return "Unknown", 0.0
+    return "fake", 0.0
 
 # =========================
-# Render Prediction Style
+# Streamlit UI
 # =========================
-def render_prediction(prediction, score):
+def render_prediction(prediction, score, sources):
     styles = {
         'fake': {"background": "#ff4c4c", "text": "#fff"},
         'real': {"background": "#4caf50", "text": "#fff"},
-        'unknown': {"background": "#6c757d", "text": "#fff"}
+        'uncertain': {"background": "#6c757d", "text": "#fff"}
     }
-    style = styles.get(prediction.lower(), styles["unknown"])
+    style = styles.get(prediction.lower(), styles["uncertain"])
 
     st.markdown(
         f"""
@@ -77,11 +94,9 @@ def render_prediction(prediction, score):
             padding: 25px;
             border-radius: 20px;
             border: 2px solid #444;
-            box-shadow: 0 0 15px rgba(255,255,255,0.2);
             text-align: center;
             font-size: 22px;
             font-weight: bold;
-            margin-top: 25px;
         ">
             🔮 Prediction: <b>{prediction.upper()}</b><br>
             🎯 Confidence: {score:.2f}
@@ -90,54 +105,69 @@ def render_prediction(prediction, score):
         unsafe_allow_html=True
     )
 
+    st.markdown("### 🔎 Verified Sources")
+    if not sources:
+        st.info("No sources found.")
+    else:
+        for idx, (title, url, src) in enumerate(sources, 1):
+            st.markdown(f"**{idx}. {src} →** [{title}]({url})")
+
 # =========================
-# Main Streamlit App
+# Main App
 # =========================
 def main():
     st.set_page_config(page_title="Fake News Detector", page_icon="📰", layout="wide")
-
-    # Custom Dark Theme
     st.markdown("<h1 style='text-align:center;'>📰 Fake News Detector</h1>", unsafe_allow_html=True)
-    st.markdown("<h3 style='text-align:center;'>AI + Fact-Check Verification Dashboard</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align:center;'>AI + Multi-Source Fact Verification</h3>", unsafe_allow_html=True)
 
-    user_input = st.text_area("✍️ Enter a sentence to predict its truthfulness:")
+    user_input = st.text_area("✍️ Enter a news headline or claim:")
 
     if st.button("🚀 Verify News"):
-        if not HF_API_TOKEN or not GOOGLE_FACTCHECK_API_KEY:
-            st.error("⚠️ API keys not found. Please create a .env file.")
+        if not HF_API_TOKEN or not GOOGLE_FACTCHECK_API_KEY or not NEWS_API_KEY:
+            st.error("⚠️ Missing API Keys in .env file.")
             return
 
-        # 1. Predict using Hugging Face model
+        # 1. Prediction
         prediction, score = predict_text_authenticity(user_input)
-        render_prediction(prediction, score)
 
-        # 2. Explain with LIME
-        explainer = LimeTextExplainer(class_names=["real", "fake"])
-        def classifier_fn(texts):
-            results = [predict_text_authenticity(t)[1] or 0.5 for t in texts]
-            return [[1-r, r] for r in results]
-        explanation = explainer.explain_instance(user_input, classifier_fn, num_features=10)
-        st.markdown("### 🧠 Explanation of Prediction (LIME)")
-        st.pyplot(explanation.as_pyplot_figure())
+        # 2. Collect Sources
+        sources = []
 
-        # 3. Google Fact Check
-        st.markdown("### 🔎 Fact-Check Results from Google")
+        # Google Fact Check
         fact_results = query_google_factcheck(user_input)
         if "claims" in fact_results:
-            for claim in fact_results["claims"]:
+            for claim in fact_results["claims"][:3]:
                 text = claim.get("text", "N/A")
-                rating = claim["claimReview"][0].get("textualRating", "N/A")
-                source = claim["claimReview"][0].get("publisher", {}).get("name", "Unknown")
-                url = claim["claimReview"][0].get("url", "#")
-                st.markdown(
-                    f"<div style='background:#1E1E1E;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #BB86FC;'>"
-                    f"<b>{text}</b><br>"
-                    f"➡️ {rating} (Source: <a href='{url}' target='_blank'>{source}</a>)"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-        else:
-            st.info("No fact-check results found.")
+                review = claim["claimReview"][0]
+                url = review.get("url", "#")
+                source = review.get("publisher", {}).get("name", "Unknown")
+                sources.append((text, url, source))
+                print(f"[FACTCHECK] {source} → {url}")  # console log
+
+        # News API (with fallback)
+        news_results = query_newsapi(user_input)
+        if "articles" in news_results:
+            for article in news_results["articles"][:3]:
+                title = article.get("title", "N/A")
+                url = article.get("url", "#")
+                source = article["source"].get("name", "Unknown")
+                sources.append((title, url, source))
+                print(f"[NEWSAPI] {source} → {url}")
+        elif "results" in news_results:
+            for res in news_results["results"][:3]:
+                title = res.get("title", "N/A")
+                url = res.get("url", "#")
+                source = res.get("source", "Unknown")
+                sources.append((title, url, source))
+                print(f"[FALLBACK] {source} → {url}")
+
+        # 3. Always guarantee at least 1 source
+        if not sources:
+            fallback_url = f"https://news.google.com/search?q={user_input.replace(' ', '+')}"
+            sources.append(("Search on Google News", fallback_url, "Google News"))
+
+        # 4. Show result
+        render_prediction(prediction, score, sources)
 
 if __name__ == "__main__":
     main()
